@@ -12,6 +12,7 @@ email=a.khalluk@dev-city.ru
 
 about=Для работы требуются слои стартовых площадок и сносимых домов с ID площадок, в которые планируется переселение.
 
+tracker=https://github.com/Anton1709/search_snos.git
 repository=https://github.com/Anton1709/search_snos.git
 # End of mandatory metadata
 
