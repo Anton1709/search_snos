@@ -1,0 +1,13 @@
+<?xml version = '1.0' encoding = 'UTF-8'?>
+<plugins>
+    <pyqgis_plugin name="Поиск сносимх домов" version="0.1">
+        <description>Поиск сносимых домов при выделении стартовой площадки</description>
+        <about>Для работы требуются слои стартовых площадок и сносимых домов с ID площадок, в которые планируется переселение.</about>
+        <version>0.1</version>
+        <qgis_minimum_version>3.0</qgis_minimum_version>
+        <homepage>https://github.com/Anton1709/search_snos.git</homepage>
+        <file_name>search_snos.zip</file_name>
+        <author_name>Антон Халлук</author_name>
+        <download_url>https://github.com/Anton1709/search_snos/blob/main/search_snos.zip</download_url>
+    </pyqgis_plugin>
+</plugins>
