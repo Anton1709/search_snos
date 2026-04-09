@@ -200,9 +200,10 @@ class SearchSnos:
         from qgis.PyQt.QtCore import QVariant
         from qgis.PyQt.QtWidgets import QMessageBox, QInputDialog
 
-        # 1. Поиск слоев
-        layers_a = QgsProject.instance().mapLayersByName('start_plot')
-        layers_b = QgsProject.instance().mapLayersByName('snos')
+        # 1. Инициализация проекта и поиск слоев
+        root = QgsProject.instance()
+        layers_a = root.mapLayersByName('start_plot')
+        layers_b = root.mapLayersByName('snos')
 
         if not layers_a or not layers_b:
             QMessageBox.critical(self.iface.mainWindow(), "Ошибка", "Слои 'start_plot' и 'snos' не найдены!")
@@ -210,9 +211,8 @@ class SearchSnos:
 
         layer_A = layers_a[0]
         layer_B = layers_b[0]
-        root = QgsProject.instance()
 
-        # 2. Определение площадки (выделение или ввод ID)
+        # 2. Определение площадки
         selected_A = layer_A.selectedFeatures()
         id_field = next((f for f in layer_A.fields().names() if f.upper() == 'ID'), None)
         
@@ -221,19 +221,15 @@ class SearchSnos:
             return
 
         main_feat = None
-
         if selected_A:
-            # Если объект уже выделен — берем его
             main_feat = selected_A[0]
         else:
-            # Если ничего не выделено — запрашиваем ID
             input_id, ok = QInputDialog.getText(self.iface.mainWindow(), 
                                                "Стартовая площадка", 
                                                "Введите ID стартовой площадки:")
             if not ok or not input_id:
                 return 
 
-            # Формируем запрос для поиска площадки (учитываем текст/число)
             is_string = layer_A.fields().field(id_field).type() == QVariant.String
             val_find = f"'{input_id}'" if is_string else str(input_id)
             
@@ -245,58 +241,53 @@ class SearchSnos:
                 return
             
             main_feat = features_A[0]
-            # Выделяем найденную площадку, чтобы визуально подтвердить выбор
             layer_A.selectByIds([main_feat.id()])
 
         target_id = main_feat[id_field]
 
-        # 3. Поиск связанных домов в слое B
-        id_fields_B = [f.name() for f in layer_B.fields() if f.name().upper().endswith('_ID')]
+        # 3. ПОИСК СВЯЗАННЫХ ДОМОВ (ЛОГИКА ПО ИНДЕКСУ СТОЛБЦА №4)
+        # Ищем во всех Joins поле, которое в исходном Excel имело индекс 3
+        id_fields_B = []
+        for join in layer_B.vectorJoins():
+            join_layer = join.joinLayer()
+            if join_layer and join_layer.fields().count() > 3:
+                # Получаем имя 4-го столбца (индекс 3) из таблицы Excel
+                orig_name = join_layer.fields().at(3).name()
+                # Формируем имя поля, как оно выглядит в слое 'snos' (Префикс_Имя)
+                full_name = join.prefix() + orig_name
+                if layer_B.fields().indexFromName(full_name) != -1:
+                    id_fields_B.append(full_name)
+
         found_houses = []
-        
         if id_fields_B:
             val_str = f"'{target_id}'" if isinstance(target_id, str) else str(target_id)
             expr = " OR ".join([f'"{f}" = {val_str}' for f in id_fields_B])
             found_houses = list(layer_B.getFeatures(QgsFeatureRequest().setFilterExpression(expr)))
         
-        # Проверка на наличие домов
         if not found_houses:
             QMessageBox.information(self.iface.mainWindow(), "Результат поиска", 
                                     f"В площадку ID {target_id} не переселяются сносимые дома.")
             layer_B.removeSelection()
             return 
         
-        # --- ЛОГИКА ВЫДЕЛЕНИЯ И ОБЩЕГО ЗУМА ---
+        # Выделение и Зум
         ids_B = [f.id() for f in found_houses]
         layer_B.selectByIds(ids_B)
         
-        # Берем границы (Bounding Box) площадки
         full_extent = main_feat.geometry().boundingBox()
-        
-        # Объединяем их с границами найденных домов
         for house in found_houses:
-            house_bbox = house.geometry().boundingBox()
-            # Метод combineExtent в Python API часто заменяется на union
-            full_extent.combineExtentWith(house_bbox) 
+            full_extent.combineExtentWith(house.geometry().boundingBox()) 
         
-        # Добавляем отступ 15%
-        if full_extent.width() > 0 or full_extent.height() > 0:
-            padding = max(full_extent.width(), full_extent.height()) * 0.15
-            full_extent.grow(padding)
-        else:
-            full_extent.grow(100) # Если это точка
-        
-        # Устанавливаем камеру
+        padding = max(full_extent.width(), full_extent.height()) * 0.15
+        full_extent.grow(padding if padding > 0 else 100)
         self.iface.mapCanvas().setExtent(full_extent)
         self.iface.mapCanvas().refresh()
 
-
-        # 4. СОЗДАНИЕ СЛОЯ С ЦЕНТРОИДАМИ И ОБЪЕДИНЕННОЙ СТРУКТУРОЙ
+        # 4. СОЗДАНИЕ СЛОЯ С ЦЕНТРОИДАМИ
         crs = layer_A.crs().authid()
         centroid_layer = QgsVectorLayer(f"Point?crs={crs}", f"{target_id}_центроиды", "memory")
         prov = centroid_layer.dataProvider()
         
-        # Собираем уникальный список полей из обоих слоев
         all_fields = [QgsField("OBJECT_TYPE", QVariant.String)]
         added_names = {"OBJECT_TYPE"}
 
@@ -309,7 +300,7 @@ class SearchSnos:
         centroid_layer.updateFields()
         new_fields = centroid_layer.fields()
 
-        # Добавляем площадку
+        # Добавляем центроид площадки
         feat_A = QgsFeature(new_fields)
         feat_A.setGeometry(main_feat.geometry().centroid())
         feat_A.setAttribute("OBJECT_TYPE", "Стартовая площадка")
@@ -317,7 +308,7 @@ class SearchSnos:
             feat_A.setAttribute(f.name(), main_feat[f.name()])
         prov.addFeature(feat_A)
 
-        # Добавляем дома
+        # Добавляем центроиды домов
         for house in found_houses:
             feat_B = QgsFeature(new_fields)
             feat_B.setGeometry(house.geometry().centroid())
@@ -326,7 +317,7 @@ class SearchSnos:
                 feat_B.setAttribute(f.name(), house[f.name()])
             prov.addFeature(feat_B)
 
-        # 5. Добавление и перемещение над слоем snos
+        # 5. Добавление в проект и управление деревом слоев
         root.addMapLayer(centroid_layer)
         layer_tree = root.layerTreeRoot()
         snos_node = layer_tree.findLayer(layer_B.id())
@@ -339,7 +330,4 @@ class SearchSnos:
             parent.insertChildNode(index, new_clone)
             parent.removeChildNode(new_node)
 
-        # Финальное выделение площадки
         layer_A.selectByIds([main_feat.id()])
-
-
