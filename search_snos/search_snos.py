@@ -331,3 +331,4 @@ class SearchSnos:
             parent.removeChildNode(new_node)
 
         layer_A.selectByIds([main_feat.id()])
+        self.iface.setActiveLayer(layer_A)
