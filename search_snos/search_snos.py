@@ -169,7 +169,7 @@ class SearchSnos:
         # Создаем действие (кнопку), указывая прямой путь к файлу
         self.action = QAction(
             QIcon(icon_path), 
-            u'Поиск сносимых домов при выделении стартовой площадки', 
+            u'Поиск сносимых домов', 
             self.iface.mainWindow()
         )
         
@@ -196,9 +196,13 @@ class SearchSnos:
     def run(self):
         """Метод, который запускается при клике на иконку плагина"""
         from qgis.core import (QgsProject, QgsFeature, QgsGeometry, QgsVectorLayer, 
-                               QgsField, QgsExpression, QgsFeatureRequest)
-        from qgis.PyQt.QtCore import QVariant
+                               QgsField, QgsExpression, QgsFeatureRequest, QgsPointXY,
+                               QgsSingleSymbolRenderer, QgsSimpleLineSymbolLayer, QgsSymbol,
+                               QgsPalLayerSettings, QgsTextFormat, QgsTextBufferSettings,
+                               QgsVectorLayerSimpleLabeling, QgsMarkerSymbol)
+        from qgis.PyQt.QtCore import QVariant, Qt
         from qgis.PyQt.QtWidgets import QMessageBox, QInputDialog
+        from qgis.PyQt.QtGui import QColor
 
         # 1. Инициализация проекта и поиск слоев
         root = QgsProject.instance()
@@ -227,7 +231,8 @@ class SearchSnos:
             input_id, ok = QInputDialog.getText(self.iface.mainWindow(), 
                                                "Стартовая площадка", 
                                                "Введите ID стартовой площадки:")
-            if not ok or not input_id:
+            if not ok or not input_id: 
+                layer_A.removeSelection()
                 return 
 
             is_string = layer_A.fields().field(id_field).type() == QVariant.String
@@ -238,22 +243,22 @@ class SearchSnos:
             
             if not features_A:
                 QMessageBox.warning(self.iface.mainWindow(), "Не найдено", f"Площадка с ID {input_id} не найдена.")
+                layer_A.removeSelection()
+                layer_B.removeSelection()
                 return
             
             main_feat = features_A[0]
             layer_A.selectByIds([main_feat.id()])
 
         target_id = main_feat[id_field]
+        plot_address = main_feat['adress'] if 'adress' in [f.name() for f in layer_A.fields()] else "Адрес не указан"
 
-        # 3. ПОИСК СВЯЗАННЫХ ДОМОВ (ЛОГИКА ПО ИНДЕКСУ СТОЛБЦА №4)
-        # Ищем во всех Joins поле, которое в исходном Excel имело индекс 3
+        # 3. ПОИСК СВЯЗАННЫХ ДОМОВ
         id_fields_B = []
         for join in layer_B.vectorJoins():
             join_layer = join.joinLayer()
             if join_layer and join_layer.fields().count() > 3:
-                # Получаем имя 4-го столбца (индекс 3) из таблицы Excel
                 orig_name = join_layer.fields().at(3).name()
-                # Формируем имя поля, как оно выглядит в слое 'snos' (Префикс_Имя)
                 full_name = join.prefix() + orig_name
                 if layer_B.fields().indexFromName(full_name) != -1:
                     id_fields_B.append(full_name)
@@ -267,68 +272,201 @@ class SearchSnos:
         if not found_houses:
             QMessageBox.information(self.iface.mainWindow(), "Результат поиска", 
                                     f"В площадку ID {target_id} не переселяются сносимые дома.")
+            layer_A.removeSelection()
             layer_B.removeSelection()
-            return 
+            return
         
-        # Выделение и Зум
-        ids_B = [f.id() for f in found_houses]
-        layer_B.selectByIds(ids_B)
+        # УДАЛЕНИЕ СТАРЫХ СЛОЕВ
+        layers_to_remove = [l.id() for l in root.mapLayers().values() if l.name().endswith("_связи") or l.name().endswith("_центроиды")]
+        if layers_to_remove:
+            root.removeMapLayers(layers_to_remove)
         
-        full_extent = main_feat.geometry().boundingBox()
-        for house in found_houses:
-            full_extent.combineExtentWith(house.geometry().boundingBox()) 
-        
-        padding = max(full_extent.width(), full_extent.height()) * 0.15
-        full_extent.grow(padding if padding > 0 else 100)
-        self.iface.mapCanvas().setExtent(full_extent)
-        self.iface.mapCanvas().refresh()
-
-        # 4. СОЗДАНИЕ СЛОЯ С ЦЕНТРОИДАМИ
+        # 4. СОЗДАНИЕ СЛОЕВ
         crs = layer_A.crs().authid()
-        centroid_layer = QgsVectorLayer(f"Point?crs={crs}", f"{target_id}_центроиды", "memory")
-        prov = centroid_layer.dataProvider()
+        line_layer = QgsVectorLayer(f"LineString?crs={crs}", f"{target_id}_связи", "memory")
+        point_layer = QgsVectorLayer(f"Point?crs={crs}", f"{target_id}_центроиды", "memory") # Переименовано
         
-        all_fields = [QgsField("OBJECT_TYPE", QVariant.String)]
-        added_names = {"OBJECT_TYPE"}
+        line_prov = line_layer.dataProvider()
+        point_prov = point_layer.dataProvider()
+        
+        # --- ПОЛЯ ДЛЯ ЛИНЕЙНОГО СЛОЯ ---
+        line_fields = [
+            QgsField("ADRESS_START", QVariant.String), 
+            QgsField("DISTANCE", QVariant.Double, "Double", 10, 2)
+        ]
+        added_line = {"ADRESS_START", "DISTANCE"}
+        for f in layer_B.fields():
+            if f.name() not in added_line:
+                line_fields.append(f)
+        
+        line_prov.addAttributes(line_fields)
+        line_layer.updateFields()
 
-        for f in list(layer_A.fields()) + list(layer_B.fields()):
-            if f.name() not in added_names:
-                all_fields.append(f)
-                added_names.add(f.name())
-
-        prov.addAttributes(all_fields)
-        centroid_layer.updateFields()
-        new_fields = centroid_layer.fields()
-
-        # Добавляем центроид площадки
-        feat_A = QgsFeature(new_fields)
-        feat_A.setGeometry(main_feat.geometry().centroid())
-        feat_A.setAttribute("OBJECT_TYPE", "Стартовая площадка")
+        # --- ПОЛЯ ДЛЯ ТОЧЕЧНОГО СЛОЯ ---
+        point_fields = [
+            QgsField("OBJECT_TYPE", QVariant.String),
+            QgsField("DISTANCE", QVariant.Double, "Double", 10, 2)
+        ]
+        added_point = {"OBJECT_TYPE", "DISTANCE"}
+        
+        # Добавляем поля от start_plot
         for f in layer_A.fields():
-            feat_A.setAttribute(f.name(), main_feat[f.name()])
-        prov.addFeature(feat_A)
+            if f.name() not in added_point:
+                point_fields.append(f)
+                added_point.add(f.name())
+        
+        # Добавляем поля от snos
+        for f in layer_B.fields():
+            if f.name() not in added_point:
+                point_fields.append(f)
+                added_point.add(f.name())
 
-        # Добавляем центроиды домов
+        point_prov.addAttributes(point_fields)
+        point_layer.updateFields()
+
+        # Геометрия старта
+        geom_A = main_feat.geometry()
+        start_geom = geom_A.centroid() if geom_A.contains(geom_A.centroid()) else geom_A.pointOnSurface()
+        start_pt = start_geom.asPoint()
+
+        new_lines = []
+        new_points = []
+
+        # 4.1 ТОЧКА ЦЕНТРА ПЛОЩАДКИ
+        feat_start_point = QgsFeature(point_layer.fields())
+        feat_start_point.setGeometry(start_geom)
+        feat_start_point.setAttribute("OBJECT_TYPE", "Стартовая площадка")
+        feat_start_point.setAttribute("DISTANCE", 0)
+        for f in layer_A.fields():
+            feat_start_point.setAttribute(f.name(), main_feat[f.name()])
+        new_points.append(feat_start_point)
+
+        # 4.2 ДОМА (ЛИНИИ И ТОЧКИ)
         for house in found_houses:
-            feat_B = QgsFeature(new_fields)
-            feat_B.setGeometry(house.geometry().centroid())
-            feat_B.setAttribute("OBJECT_TYPE", "Сносимый дом")
-            for f in layer_B.fields():
-                feat_B.setAttribute(f.name(), house[f.name()])
-            prov.addFeature(feat_B)
+            h_geom = house.geometry()
+            h_center = h_geom.centroid() if h_geom.contains(h_geom.centroid()) else h_geom.pointOnSurface()
+            line_geom = QgsGeometry.fromPolylineXY([start_pt, h_center.asPoint()])
+            dist = round(line_geom.length(), 2)
+            
+            # Создание линии
+            f_line = QgsFeature(line_layer.fields())
+            f_line.setGeometry(line_geom)
+            f_line.setAttribute("ADRESS_START", plot_address)
+            f_line.setAttribute("DISTANCE", dist)
+            for f in layer_B.fields(): 
+                f_line.setAttribute(f.name(), house[f.name()])
+            new_lines.append(f_line)
+            
+            # Создание точки дома
+            f_point = QgsFeature(point_layer.fields())
+            f_point.setGeometry(h_center)
+            f_point.setAttribute("OBJECT_TYPE", "Сносимый дом")
+            f_point.setAttribute("DISTANCE", dist)
+            for f in layer_B.fields(): 
+                f_point.setAttribute(f.name(), house[f.name()])
+            new_points.append(f_point)
 
-        # 5. Добавление в проект и управление деревом слоев
-        root.addMapLayer(centroid_layer)
+        line_prov.addFeatures(new_lines)
+        point_prov.addFeatures(new_points)
+
+        # 5. СТИЛИЗАЦИЯ
+        from qgis.core import (QgsSingleSymbolRenderer, QgsRuleBasedRenderer, 
+                               QgsSymbol, QgsSimpleLineSymbolLayer, QgsMarkerSymbol)
+
+        # 5.1 Стиль для ЛИНЕЙНОГО слоя
+        symbol_line = QgsSymbol.defaultSymbol(line_layer.geometryType())
+        line_layer_style = QgsSimpleLineSymbolLayer.create({
+            'color': 'red', 
+            'width': '0.4', 
+            'line_style': 'solid'
+        })
+        symbol_line.changeSymbolLayer(0, line_layer_style)
+        line_layer.setRenderer(QgsSingleSymbolRenderer(symbol_line))
+
+        # 5.2 Стиль для ТОЧЕЧНОГО слоя
+        # Создаем пустой корень правил
+        root_rule = QgsRuleBasedRenderer.Rule(None)
+
+        # Правило для Стартовой площадки (Синяя точка, покрупнее)
+        symbol_start = QgsMarkerSymbol.createSimple({
+            'name': 'circle',
+            'color': 'blue',
+            'outline_color': 'white',
+            'size': '4',
+            'outline_width': '0.4'
+        })
+        rule_start = QgsRuleBasedRenderer.Rule(symbol_start, 
+                                               filterExp="\"OBJECT_TYPE\" = 'Стартовая площадка'", 
+                                               label="Стартовая площадка")
+
+        # Правило для Сносимых домов (Красная точка, поменьше)
+        symbol_house = QgsMarkerSymbol.createSimple({
+            'name': 'circle',
+            'color': 'red',
+            'outline_color': 'white',
+            'size': '2.5',
+            'outline_width': '0.3'
+        })
+        rule_house = QgsRuleBasedRenderer.Rule(symbol_house, 
+                                               filterExp="\"OBJECT_TYPE\" = 'Сносимый дом'", 
+                                               label="Сносимые дома")
+
+        # Добавляем правила в дерево и применяем к слою
+        root_rule.appendChild(rule_start)
+        root_rule.appendChild(rule_house)
+        
+        point_renderer = QgsRuleBasedRenderer(root_rule)
+        point_layer.setRenderer(point_renderer)
+
+        # Обновляем интерфейс
+        line_layer.triggerRepaint()
+        point_layer.triggerRepaint()
+
+        # 6. ПОДПИСИ (для линий)
+        text_format = QgsTextFormat()
+        text_format.setSize(8)
+        text_format.setColor(QColor("black"))
+        buffer = QgsTextBufferSettings()
+        buffer.setEnabled(True)
+        buffer.setSize(0.8)
+        buffer.setColor(QColor("white"))
+        text_format.setBuffer(buffer)
+
+        label_settings = QgsPalLayerSettings()
+        label_settings.setFormat(text_format)
+        label_settings.isExpression = True
+        label_settings.fieldName = "format_number(DISTANCE, 0) || ' м'"
+        label_settings.enabled = True
+        label_settings.placement = QgsPalLayerSettings.Line 
+        label_settings.placementFlags = QgsPalLayerSettings.OnLine | QgsPalLayerSettings.MapOrientation
+        
+        line_layer.setLabeling(QgsVectorLayerSimpleLabeling(label_settings))
+        line_layer.setLabelsEnabled(True)
+
+        # 7. ДОБАВЛЕНИЕ В ПРОЕКТ
+        root.addMapLayer(line_layer)
+        root.addMapLayer(point_layer)
+        
+        # Упорядочивание слоев в дереве
         layer_tree = root.layerTreeRoot()
         snos_node = layer_tree.findLayer(layer_B.id())
-        new_node = layer_tree.findLayer(centroid_layer.id())
         
-        if snos_node and new_node:
-            parent = snos_node.parent()
-            index = parent.children().index(snos_node)
-            new_clone = new_node.clone()
-            parent.insertChildNode(index, new_clone)
-            parent.removeChildNode(new_node)
+        for lyr in [point_layer, line_layer]:
+            node = layer_tree.findLayer(lyr.id())
+            if snos_node and node:
+                parent = snos_node.parent()
+                idx = parent.children().index(snos_node)
+                parent.insertChildNode(idx, node.clone())
+                parent.removeChildNode(node)
 
+        self.iface.mapCanvas().refresh()
+
+        # ЗУМ И ВЫДЕЛЕНИЕ
+        full_extent = main_feat.geometry().boundingBox()
+        for h in found_houses: full_extent.combineExtentWith(h.geometry().boundingBox())
+        full_extent.grow(full_extent.width() * 0.15)
+        self.iface.mapCanvas().setExtent(full_extent)
+        
         layer_A.selectByIds([main_feat.id()])
+        layer_B.selectByIds([f.id() for f in found_houses])
         self.iface.setActiveLayer(layer_A)
